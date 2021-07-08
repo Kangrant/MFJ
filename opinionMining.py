@@ -136,54 +136,13 @@ class opinionMining(nn.Module):
             r_tensor = r_tensor.cuda()
 
         for i in range(steps):
-            # target syn
-            r_temp = r_tensor.ge(self.relation_threds).float() #greater than or equal to [batch,seq_len,seq_len]
-            r_tensor = r_tensor * r_temp # b x s x s
-            target_weighted = torch.bmm(r_tensor, sequence_output)#[b,s,768]
-            target_div = torch.sum(r_tensor, 2) #[b,s]
-            targetIfZero = target_div.eq(0).float() #equals [b,s]
-            target_div = target_div + targetIfZero
-            target_div = target_div.unsqueeze(2).repeat(1, 1, self.bert_encoder_dim) #[b,s,768]
-            target_r = torch.div(target_weighted, target_div) #[b,s,768]
-            target_hidden = F.linear(sequence_output, self.targetSyn_s, None) + F.linear(target_r, self.targetSyn_r, None) #[b,s,250]
-            target_hidden = torch.tanh(target_hidden) #[b,s,250]
+            target_hidden = self.Table2Seq(sequence_output=sequence_output,r_tensor=r_tensor)
 
-            # relation syn
-            relation_weighted = torch.bmm(t_tensor, sequence_output) #i和j token有关系的可能性  无关值为0
-            relation_div = torch.sum(t_tensor, 2)
-            relationIfZero = relation_div.eq(0).float()
-            relation_div = relation_div + relationIfZero
-            relation_div = relation_div.unsqueeze(2).repeat(1, 1, self.bert_encoder_dim)
-            relation_a = torch.div(relation_weighted, relation_div)
-            relation_hidden = F.linear(sequence_output, self.relationSyn_s, None)+F.linear(relation_a, self.relationSyn_u, None)
-            relation_hidden = torch.tanh(relation_hidden)
+            relation_hidden = self.Seq2Table(sequence_output=sequence_output,t_tensor=t_tensor)
 
-            # crf   [b,s,tag_size]
-            targetPredictInput = F.linear(target_hidden, self.targetHidden2Tag, self.targetHidden2Tag_b)#self.targetHidden2Tag(target_hidden)
+            targetPredictInput,t_tensor = self.SeqEncoding(all_input_mask,target_hidden)
 
-            # Relation Attention
-            relationScore = self.relationAttention(relation_hidden)
-
-
-            # update T_tensor
-            tag_score, tag_seq = self.crf._viterbi_decode(targetPredictInput, all_input_mask.byte())#[b,s]
-            threads = []
-            temp_T_tensor = torch.zeros(batch_size, seq_len, seq_len)#通过tag_seq，将识别出的实体置1
-            if self.gpu:
-                temp_T_tensor = temp_T_tensor.cuda()
-            #一个batch内,多线程同时进行tag_seq解析，将识别出的实体标记为1
-            for i in range(batch_size):
-                t = threading.Thread(target=self.makeEntity, args=(i, tag_seq[i, :], temp_T_tensor, seq_len))
-                threads.append(t)
-            for i in range(batch_size):
-                threads[i].start()
-            for i in range(batch_size):
-                threads[i].join()
-            tag_score_final = tag_score.unsqueeze(2).repeat(1, 1, seq_len)+tag_score.unsqueeze(1).repeat(1, seq_len, 1)
-            t_tensor = tag_score_final * temp_T_tensor
-
-            # Update R_tensor
-            r_tensor = relationScore * (maskMatrix.float())
+            r_tensor = self.TableEncoding(relation_hidden,maskMatrix)
 
         return targetPredictInput, r_tensor
     def makeEntity(self, idx, tag_seq, temp_T_tensor, seq_len):
@@ -220,3 +179,71 @@ class opinionMining(nn.Module):
             temp_T_tensor[idx, Obegin:Oend, Obegin:Oend] = torch.ones(Oend - Obegin, Oend - Obegin)
 
         return temp_T_tensor
+
+    def Table2Seq(self,sequence_output,r_tensor):
+        """
+        根据关系表更新序列
+        """
+        # target syn
+        r_temp = r_tensor.ge(self.relation_threds).float() #greater than or equal to [batch,seq_len,seq_len]
+        r_tensor = r_tensor * r_temp # b x s x s
+        target_weighted = torch.bmm(r_tensor, sequence_output)#[b,s,768]
+        target_div = torch.sum(r_tensor, 2) #[b,s]
+        targetIfZero = target_div.eq(0).float() #equals [b,s]
+        target_div = target_div + targetIfZero
+        target_div = target_div.unsqueeze(2).repeat(1, 1, self.bert_encoder_dim) #[b,s,768]
+        target_r = torch.div(target_weighted, target_div) #[b,s,768]
+        target_hidden = F.linear(sequence_output, self.targetSyn_s, None) + F.linear(target_r, self.targetSyn_r, None) #[b,s,250]
+        target_hidden = torch.tanh(target_hidden) #[b,s,250]
+
+        return  target_hidden
+
+    def Seq2Table(self,sequence_output,t_tensor):
+        """
+        根据序列更新关系表
+        """
+        # relation syn
+        relation_weighted = torch.bmm(t_tensor, sequence_output) #i和j token有关系的可能性  无关值为0
+        relation_div = torch.sum(t_tensor, 2)
+        relationIfZero = relation_div.eq(0).float()
+        relation_div = relation_div + relationIfZero
+        relation_div = relation_div.unsqueeze(2).repeat(1, 1, self.bert_encoder_dim)
+        relation_a = torch.div(relation_weighted, relation_div)
+        relation_hidden = F.linear(sequence_output, self.relationSyn_s, None)+F.linear(relation_a, self.relationSyn_u, None)
+        relation_hidden = torch.tanh(relation_hidden)
+
+        return relation_hidden
+
+    def SeqEncoding(self,all_input_mask,target_hidden):
+        batch_size = all_input_mask.size(0)
+        seq_len = all_input_mask.size(1)
+
+        # crf   [b,s,tag_size]
+        targetPredictInput = F.linear(target_hidden, self.targetHidden2Tag, self.targetHidden2Tag_b)
+
+        # update T_tensor
+        tag_score, tag_seq = self.crf._viterbi_decode(targetPredictInput, all_input_mask.byte())#[b,s]
+        threads = []
+        temp_T_tensor = torch.zeros(batch_size, seq_len, seq_len)#通过tag_seq，将识别出的实体置1
+        if self.gpu:
+            temp_T_tensor = temp_T_tensor.cuda()
+        #一个batch内,多线程同时进行tag_seq解析，将识别出的实体标记为1
+        for i in range(batch_size):
+            t = threading.Thread(target=self.makeEntity, args=(i, tag_seq[i, :], temp_T_tensor, seq_len))
+            threads.append(t)
+        for i in range(batch_size):
+            threads[i].start()
+        for i in range(batch_size):
+            threads[i].join()
+        tag_score_final = tag_score.unsqueeze(2).repeat(1, 1, seq_len)+tag_score.unsqueeze(1).repeat(1, seq_len, 1)
+        t_tensor = tag_score_final * temp_T_tensor
+        return targetPredictInput,t_tensor
+
+    def TableEncoding(self,relation_hidden,maskMatrix):
+        # Relation Attention
+        relationScore = self.relationAttention(relation_hidden)
+
+        # Update R_tensor
+        r_tensor = relationScore * (maskMatrix.float())
+
+        return r_tensor
